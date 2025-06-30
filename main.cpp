@@ -8,17 +8,12 @@
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
-#include <thread>
-#include <atomic>
 
 #include "Gui.h"
 #include "LuaEngine.h"
 #include "Log.h"  // Добавлено для OutputLogMessage
+#include "InputThread.h"   // Новый файл с потоком
 
-static std::atomic_bool g_running = true;
-static std::thread g_inputThread;
-static std::thread g_luaThread;
-static std::mutex g_luaMutex;
 
 // DirectX
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -46,36 +41,6 @@ struct InputEvent {
 static std::queue<InputEvent> g_eventQueue;
 static std::mutex g_eventMutex;
 
-void InputProcessingThread() {
-    // Устанавливаем высокий приоритет для потока ввода
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-
-    while (g_running) {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        ProcessInputPolling();
-        ProcessEventQueue();
-
-        // Точное поддержание частоты 1000Hz
-        auto end = std::chrono::high_resolution_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        std::this_thread::sleep_for(std::chrono::microseconds(1000) - elapsed);
-    }
-}
-
-void LuaExecutionThread() {
-    while (g_running) {
-        // Блокируем только на время выполнения Lua скриптов
-        {
-            std::lock_guard<std::mutex> lock(g_luaMutex);
-            if (g_pLuaEngine) {
-                g_pLuaEngine->ExecutePendingTasks();
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-
 // Forward declarations
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void CreateRenderTarget();
@@ -93,17 +58,12 @@ Gui* g_pGui = nullptr;
 
 // Функция для добавления события в очередь
 void QueueInputEvent(const std::string& eventName, int arg) {
-    if (!g_pLuaEngine) return;
-
-    // Используем лямбду для безопасной передачи задачи
-    g_pLuaEngine->PostTask([eventName, arg]() {
-        try {
-            g_pLuaEngine->CallOnEvent(eventName.c_str(), arg);
-        }
-        catch (const std::exception& e) {
-            // Обработка ошибок
-        }
-        });
+    std::lock_guard<std::mutex> lock(g_eventMutex);
+    InputEvent event;
+    event.eventName = eventName;
+    event.argument = arg;
+    event.timestamp = std::chrono::steady_clock::now();
+    g_eventQueue.push(event);
 }
 
 // Обработка всех событий из очереди
@@ -217,6 +177,8 @@ void ProcessInputPolling() {
         OutputLogMessage("[INPUT POLLING UNKNOWN ERROR]\n");
     }
 }
+static InputThread g_InputThread;
+static LuaEngine* luaEngine = nullptr;  // если уже есть, не дублируй
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Включаем консоль для отладки
@@ -226,10 +188,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     //freopen_s(&fDummy, "CONOUT$", "w", stderr);
     //SetConsoleTitleA("Debug Console");
     //std::cout << "Приложение запущено. Отладка включена.\n";
-
-    g_running = true;
-    g_inputThread = std::thread(InputProcessingThread);
-    g_luaThread = std::thread(LuaExecutionThread);
 
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L,
                       hInstance, NULL, NULL, NULL, NULL,
@@ -273,7 +231,69 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         });
 
     // Запуск высокочастотного таймера для ввода (1мс = 1000Hz)
-    // SetTimer(hwnd, INPUT_TIMER_ID, INPUT_POLL_INTERVAL, nullptr);
+    SetTimer(hwnd, INPUT_TIMER_ID, INPUT_POLL_INTERVAL, nullptr);
+
+    // Запуск GUI таймера (16мс = ~60FPS, можно настроить под монитор)
+    // Для 144Hz можно поставить 7мс (142FPS)
+    SetTimer(hwnd, GUI_TIMER_ID, 7, nullptr);
+
+    std::cout << "Таймеры запущены:\n";
+    std::cout << "- Input polling: " << INPUT_POLL_INTERVAL << "мс (" << (1000 / INPUT_POLL_INTERVAL) << "Hz)\n";
+    std::cout << "- GUI refresh: 7мс (~142Hz)\n";
+
+    // ========== Здесь начинаем запускать отдельный поток для считывания ввода ==========
+    g_InputThread.SetCallback([](int vk) {
+        if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9) {
+            int arg = 9 + (vk - VK_NUMPAD1 + 1); // 10-18
+            OutputLogMessage("InputThread: Нажат Num" + std::to_string(vk - VK_NUMPAD0) + "\n");
+            if (g_pLuaEngine) {
+                g_pLuaEngine->CallOnEvent("MOUSE_BUTTON_PRESSED", arg);
+            }
+        }
+        else if (vk == VK_NUMPAD0) {
+            OutputLogMessage("InputThread: Нажат Num0\n");
+            if (g_pLuaEngine) {
+                g_pLuaEngine->CallOnEvent("MOUSE_BUTTON_PRESSED", 19);
+            }
+        }
+        });
+    g_InputThread.Start();
+    // ================================================================================
+
+    MSG msg;
+    ZeroMemory(&msg, sizeof(msg));
+    while (msg.message != WM_QUIT) {
+        // Обрабатываем сообщения Windows
+        while (::PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
+            ::TranslateMessage(&msg);
+            ::DispatchMessage(&msg);
+        }
+
+        // Легкая пауза для снижения нагрузки на CPU в основном цикле
+        Sleep(1);
+    }
+
+    // ========== Здесь останавливаем поток перед выходом ==========
+    g_InputThread.Stop();
+    // =============================================================
+
+    KillTimer(hwnd, INPUT_TIMER_ID);
+    KillTimer(hwnd, GUI_TIMER_ID);
+    g_pLuaEngine = nullptr;
+    g_pGui = nullptr;
+
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    CleanupDeviceD3D();
+    ::DestroyWindow(hwnd);
+    ::UnregisterClass(wc.lpszClassName, wc.hInstance);
+    return 0;
+}
+
+
+    // Запуск высокочастотного таймера для ввода (1мс = 1000Hz)
+    SetTimer(hwnd, INPUT_TIMER_ID, INPUT_POLL_INTERVAL, nullptr);
 
     // Запуск GUI таймера (16мс = ~60FPS, можно настроить под монитор)
     // Для 144Hz можно поставить 7мс (142FPS)
@@ -310,10 +330,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ::DestroyWindow(hwnd);
     ::UnregisterClass(wc.lpszClassName, wc.hInstance);
     return 0;
-
-    g_running = false;
-    if (g_inputThread.joinable()) g_inputThread.join();
-    if (g_luaThread.joinable()) g_luaThread.join();
 }
 
 // Win32 & DX helpers below...
@@ -368,91 +384,63 @@ void CleanupRenderTarget() {
 // ImGui WndProc
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    // Обработка сообщений ImGui
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-        return true;
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
 
     switch (msg) {
     case WM_TIMER:
-        // Теперь у нас только один GUI-таймер
-        if (wParam == GUI_TIMER_ID) {
+        if (wParam == INPUT_TIMER_ID) {
+            // Высокочастотный опрос ввода (1000Hz)
+            ProcessInputPolling();
+        }
+        else if (wParam == GUI_TIMER_ID) {
+            // Обновление GUI и обработка событий
             try {
-                // Подготовка нового кадра ImGui
+                ProcessEventQueue();
+
+                // Start the ImGui frame
                 ImGui_ImplDX11_NewFrame();
                 ImGui_ImplWin32_NewFrame();
                 ImGui::NewFrame();
 
-                // Рендеринг GUI (только визуальная часть)
+                // Получаем GUI объект из глобальной переменной
                 if (g_pGui) {
                     g_pGui->Render();
                 }
 
-                // Завершение рендеринга ImGui
                 ImGui::Render();
-
-                // Очистка буфера и рендеринг
                 const float clear_color[4] = { 0.1f, 0.1f, 0.1f, 1.00f };
-                g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+                g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, NULL);
                 g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
                 ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
-                // Презентация кадра с минимальной задержкой
                 g_pSwapChain->Present(1, 0);
             }
             catch (const sol::error& e) {
-                std::cerr << "SOL ERROR IN GUI RENDERING: " << e.what() << std::endl;
+                std::cerr << "SOL ERROR IN GUI TIMER: " << e.what() << std::endl;
                 OutputLogMessage("[FATAL SOL ERROR] " + std::string(e.what()) + "\n");
             }
             catch (const std::exception& e) {
-                std::cerr << "EXCEPTION IN GUI RENDERING: " << e.what() << std::endl;
+                std::cerr << "EXCEPTION IN GUI TIMER: " << e.what() << std::endl;
                 OutputLogMessage("[FATAL EXCEPTION] " + std::string(e.what()) + "\n");
             }
             catch (...) {
-                std::cerr << "UNKNOWN EXCEPTION IN GUI RENDERING" << std::endl;
+                std::cerr << "UNKNOWN EXCEPTION IN GUI TIMER" << std::endl;
                 OutputLogMessage("[FATAL UNKNOWN EXCEPTION]\n");
             }
         }
         return 0;
 
     case WM_SIZE:
-        if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
-            // Обработка изменения размера окна
+        if (g_pd3dDevice != NULL && wParam != SIZE_MINIMIZED) {
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
             CreateRenderTarget();
-
-            // Обновляем информацию о размере окна для Lua
-            if (g_pLuaEngine) {
-                g_pLuaEngine->SetWindowSize(LOWORD(lParam), HIWORD(lParam));
-            }
-        }
-        return 0;
-
-    case WM_SETFOCUS:
-        // Окно получило фокус - можно обновить состояние
-        if (g_pLuaEngine) {
-            g_pLuaEngine->OnFocusGained();
-        }
-        return 0;
-
-    case WM_KILLFOCUS:
-        // Окно потеряло фокус
-        if (g_pLuaEngine) {
-            g_pLuaEngine->OnFocusLost();
         }
         return 0;
 
     case WM_DESTROY:
+        g_InputThread.Stop();
         ::PostQuitMessage(0);
         return 0;
-
-    case WM_DEVICECHANGE:
-        // Обработка изменения устройств (например, подключение/отключение мыши)
-        if (g_pLuaEngine) {
-            g_pLuaEngine->CheckConnectedDevices();
-        }
-        return 0;
     }
-
     return ::DefWindowProc(hWnd, msg, wParam, lParam);
 }
