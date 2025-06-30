@@ -11,9 +11,8 @@
 
 #include "Gui.h"
 #include "LuaEngine.h"
-#include "Log.h"  // Добавлено для OutputLogMessage
-#include "InputThread.h"   // Новый файл с потоком
-
+#include "Log.h"
+#include "InputThread.h"
 
 // DirectX
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -24,14 +23,14 @@ static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 // Таймеры
 #define INPUT_TIMER_ID 1
 #define GUI_TIMER_ID 2
-#define INPUT_POLL_INTERVAL 1  // 1мс = 1000Hz для надежного перехвата
+#define INPUT_POLL_INTERVAL 1  // 1мс = 1000Hz
 
-// Глобальные переменные для отслеживания состояний
+// Глобальные переменные
 static bool g_keyState[256] = {};
 static bool g_mouseState[5] = {};
 static LuaEngine* g_pLuaEngine = nullptr;
 
-// Буфер событий для синхронизации
+// Буфер событий
 struct InputEvent {
     std::string eventName;
     int argument;
@@ -50,10 +49,10 @@ void CleanupDeviceD3D();
 void ProcessInputPolling();
 void ProcessEventQueue();
 
-// Глобальный HWND для использования в MoveMouseTo
+// Глобальный HWND
 HWND g_hwnd = nullptr;
 
-// Глобальный указатель на GUI для использования в WndProc
+// Глобальный указатель на GUI
 Gui* g_pGui = nullptr;
 
 // Функция для добавления события в очередь
@@ -123,11 +122,11 @@ void ProcessInputPolling() {
             int id;
             int index;
         } buttons[] = {
-            { VK_LBUTTON, 1, 0 },   // Левая кнопка (id=1)
-            { VK_RBUTTON, 2, 1 },   // Правая кнопка -> id=2 (как ожидает GHUB)
-            { VK_MBUTTON, 3, 2 },   // Средняя кнопка -> id=3 (как ожидает GHUB)
-            { VK_XBUTTON1, 4, 3 },  // Боковая кнопка 1
-            { VK_XBUTTON2, 5, 4 },  // Боковая кнопка 2
+            { VK_LBUTTON, 1, 0 },
+            { VK_RBUTTON, 2, 1 },
+            { VK_MBUTTON, 3, 2 },
+            { VK_XBUTTON1, 4, 3 },
+            { VK_XBUTTON2, 5, 4 },
         };
 
         for (auto& btn : buttons) {
@@ -178,7 +177,6 @@ void ProcessInputPolling() {
     }
 }
 static InputThread g_InputThread;
-static LuaEngine* luaEngine = nullptr;  // если уже есть, не дублируй
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Включаем консоль для отладки
@@ -196,7 +194,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     HWND hwnd = ::CreateWindow(wc.lpszClassName, _T("Helper Application"), WS_OVERLAPPEDWINDOW,
         100, 100, 1280, 720, NULL, NULL, wc.hInstance, NULL);
 
-    g_hwnd = hwnd; // Сохраняем HWND для использования в MoveMouseTo
+    g_hwnd = hwnd;
 
     if (!CreateDeviceD3D(hwnd)) return 1;
     ::ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -222,26 +220,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     LuaEngine luaEngine;
-    g_pLuaEngine = &luaEngine; // Сохраняем указатель для использования в таймере
+    g_pLuaEngine = &luaEngine;
 
     Gui gui(&luaEngine);
-    g_pGui = &gui; // Сохраняем указатель на GUI для WndProc
+    g_pGui = &gui;
     gui.SetReloadCallback([&]() {
         luaEngine.ReloadScript();
         });
 
-    // Запуск высокочастотного таймера для ввода (1мс = 1000Hz)
+    // Запуск высокочастотного таймера для ввода
     SetTimer(hwnd, INPUT_TIMER_ID, INPUT_POLL_INTERVAL, nullptr);
 
-    // Запуск GUI таймера (16мс = ~60FPS, можно настроить под монитор)
-    // Для 144Hz можно поставить 7мс (142FPS)
+    // Запуск GUI таймера
     SetTimer(hwnd, GUI_TIMER_ID, 7, nullptr);
 
     std::cout << "Таймеры запущены:\n";
     std::cout << "- Input polling: " << INPUT_POLL_INTERVAL << "мс (" << (1000 / INPUT_POLL_INTERVAL) << "Hz)\n";
     std::cout << "- GUI refresh: 7мс (~142Hz)\n";
 
-    // ========== Здесь начинаем запускать отдельный поток для считывания ввода ==========
+    // Запуск потока ввода
     g_InputThread.SetCallback([](int vk) {
         if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9) {
             int arg = 9 + (vk - VK_NUMPAD1 + 1); // 10-18
@@ -258,7 +255,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
         });
     g_InputThread.Start();
-    // ================================================================================
 
     MSG msg;
     ZeroMemory(&msg, sizeof(msg));
@@ -269,13 +265,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ::DispatchMessage(&msg);
         }
 
-        // Легкая пауза для снижения нагрузки на CPU в основном цикле
+        // Легкая пауза для снижения нагрузки на CPU
         Sleep(1);
     }
 
-    // ========== Здесь останавливаем поток перед выходом ==========
+    // Остановка потока перед выходом
     g_InputThread.Stop();
-    // =============================================================
 
     KillTimer(hwnd, INPUT_TIMER_ID);
     KillTimer(hwnd, GUI_TIMER_ID);
@@ -290,49 +285,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ::UnregisterClass(wc.lpszClassName, wc.hInstance);
     return 0;
 }
-
-
-    // Запуск высокочастотного таймера для ввода (1мс = 1000Hz)
-    SetTimer(hwnd, INPUT_TIMER_ID, INPUT_POLL_INTERVAL, nullptr);
-
-    // Запуск GUI таймера (16мс = ~60FPS, можно настроить под монитор)
-    // Для 144Hz можно поставить 7мс (142FPS)
-    SetTimer(hwnd, GUI_TIMER_ID, 7, nullptr);
-
-    std::cout << "Таймеры запущены:\n";
-    std::cout << "- Input polling: " << INPUT_POLL_INTERVAL << "мс (" << (1000 / INPUT_POLL_INTERVAL) << "Hz)\n";
-    std::cout << "- GUI refresh: 7мс (~142Hz)\n";
-
-    // Main loop - теперь более легкий
-    MSG msg;
-    ZeroMemory(&msg, sizeof(msg));
-    while (msg.message != WM_QUIT) {
-        // Обрабатываем сообщения Windows
-        while (::PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
-            ::TranslateMessage(&msg);
-            ::DispatchMessage(&msg);
-        }
-
-        // Легкая пауза для снижения нагрузки на CPU в основном цикле
-        Sleep(1);
-    }
-
-    // Очистка
-    KillTimer(hwnd, INPUT_TIMER_ID);
-    KillTimer(hwnd, GUI_TIMER_ID);
-    g_pLuaEngine = nullptr;
-    g_pGui = nullptr;
-
-    ImGui_ImplDX11_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
-    CleanupDeviceD3D();
-    ::DestroyWindow(hwnd);
-    ::UnregisterClass(wc.lpszClassName, wc.hInstance);
-    return 0;
-}
-
-// Win32 & DX helpers below...
 
 bool CreateDeviceD3D(HWND hWnd) {
     DXGI_SWAP_CHAIN_DESC sd = {};
@@ -389,11 +341,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_TIMER:
         if (wParam == INPUT_TIMER_ID) {
-            // Высокочастотный опрос ввода (1000Hz)
             ProcessInputPolling();
         }
         else if (wParam == GUI_TIMER_ID) {
-            // Обновление GUI и обработка событий
             try {
                 ProcessEventQueue();
 
@@ -402,7 +352,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ImGui_ImplWin32_NewFrame();
                 ImGui::NewFrame();
 
-                // Получаем GUI объект из глобальной переменной
                 if (g_pGui) {
                     g_pGui->Render();
                 }
@@ -438,7 +387,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_DESTROY:
-        g_InputThread.Stop();
         ::PostQuitMessage(0);
         return 0;
     }
