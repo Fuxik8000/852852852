@@ -5,6 +5,9 @@
 #include <chrono>
 #include <queue>
 #include <mutex>
+#include <mmsystem.h>  // Для высокоточного таймера
+#pragma comment(lib, "winmm.lib")
+
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
@@ -12,7 +15,6 @@
 #include "Gui.h"
 #include "LuaEngine.h"
 #include "Log.h"
-#include "InputThread.h"
 
 // DirectX
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -26,9 +28,9 @@ static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 #define INPUT_POLL_INTERVAL 1  // 1мс = 1000Hz
 
 // Глобальные переменные
-static bool g_keyState[256] = {};
-static bool g_mouseState[5] = {};
+static BYTE g_prevKeyState[256] = {};   // Предыдущее состояние клавиш
 static LuaEngine* g_pLuaEngine = nullptr;
+static UINT g_timerResolution = 1;      // Разрешение таймера
 
 // Буфер событий
 struct InputEvent {
@@ -58,6 +60,15 @@ Gui* g_pGui = nullptr;
 // Функция для добавления события в очередь
 void QueueInputEvent(const std::string& eventName, int arg) {
     std::lock_guard<std::mutex> lock(g_eventMutex);
+    // Защита от переполнения очереди
+    if (g_eventQueue.size() > 1000) {
+        // Удаляем самые старые события при переполнении
+        while (g_eventQueue.size() > 800) {
+            g_eventQueue.pop();
+        }
+        return;
+    }
+
     InputEvent event;
     event.eventName = eventName;
     event.argument = arg;
@@ -69,7 +80,11 @@ void QueueInputEvent(const std::string& eventName, int arg) {
 void ProcessEventQueue() {
     std::lock_guard<std::mutex> lock(g_eventMutex);
 
-    while (!g_eventQueue.empty()) {
+    auto start = std::chrono::steady_clock::now();
+    size_t processed = 0;
+    const size_t maxProcessPerFrame = 100; // Ограничение на обработку за один кадр
+
+    while (!g_eventQueue.empty() && processed < maxProcessPerFrame) {
         const InputEvent& event = g_eventQueue.front();
 
         try {
@@ -87,105 +102,104 @@ void ProcessEventQueue() {
         }
 
         g_eventQueue.pop();
+        processed++;
+    }
+
+    // Логирование при большой очереди
+    if (g_eventQueue.size() > 50) {
+        static auto lastLog = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastLog > std::chrono::seconds(1)) {
+            OutputLogMessage("Queue size: " + std::to_string(g_eventQueue.size()) + "\n");
+            lastLog = now;
+        }
     }
 }
 
-// Высокочастотная обработка ввода
+// Оптимизированная высокочастотная обработка ввода
 void ProcessInputPolling() {
+    // Статический массив для кнопок мыши
+    static const struct MouseButton {
+        int vk;
+        int id;
+    } buttons[] = {
+        { VK_LBUTTON, 1 },
+        { VK_RBUTTON, 2 },
+        { VK_MBUTTON, 3 },
+        { VK_XBUTTON1, 4 },
+        { VK_XBUTTON2, 5 },
+    };
+
     try {
-        // Перехват NumPad (0-9)
-        for (int vk = VK_NUMPAD0; vk <= VK_NUMPAD9; ++vk) {
-            int arg = 10 + (vk - VK_NUMPAD0);
-            SHORT state = GetAsyncKeyState(vk);
-            bool isDown = (state & 0x8000) != 0;
-
-            if (isDown && !g_keyState[vk]) {
-                QueueInputEvent("MOUSE_BUTTON_PRESSED", arg);
-#ifdef _DEBUG
-                std::cout << "NumPad pressed: " << (vk - VK_NUMPAD0)
-                    << " (arg: " << arg << ")\n";
-#endif
-            }
-            else if (!isDown && g_keyState[vk]) {
-                QueueInputEvent("MOUSE_BUTTON_RELEASED", arg);
-#ifdef _DEBUG
-                std::cout << "NumPad released: " << (vk - VK_NUMPAD0)
-                    << " (arg: " << arg << ")\n";
-#endif
-            }
-            g_keyState[vk] = isDown;
-        }
-
         // Обработка кнопок мыши
-        struct MouseButton {
-            int vk;
-            int id;
-            int index;
-        } buttons[] = {
-            { VK_LBUTTON, 1, 0 },
-            { VK_RBUTTON, 2, 1 },
-            { VK_MBUTTON, 3, 2 },
-            { VK_XBUTTON1, 4, 3 },
-            { VK_XBUTTON2, 5, 4 },
-        };
+        for (const auto& btn : buttons) {
+            bool isDown = (GetAsyncKeyState(btn.vk) & 0x8000) != 0;
+            bool wasDown = g_prevKeyState[btn.vk] & 0x80;
 
-        for (auto& btn : buttons) {
-            SHORT state = GetAsyncKeyState(btn.vk);
-            bool isDown = (state & 0x8000) != 0;
-
-            if (isDown && !g_mouseState[btn.index]) {
-                QueueInputEvent("MOUSE_BUTTON_PRESSED", btn.id);
-#ifdef _DEBUG
-                std::cout << "Mouse button PRESSED: "
-                    << "VK=0x" << std::hex << btn.vk << std::dec
-                    << ", ID=" << btn.id
-                    << ", Index=" << btn.index << std::endl;
-#endif
+            if (isDown != wasDown) {
+                if (isDown) {
+                    QueueInputEvent("MOUSE_BUTTON_PRESSED", btn.id);
+                }
+                else {
+                    QueueInputEvent("MOUSE_BUTTON_RELEASED", btn.id);
+                }
+                g_prevKeyState[btn.vk] = isDown ? 0x80 : 0;
             }
-            else if (!isDown && g_mouseState[btn.index]) {
-                QueueInputEvent("MOUSE_BUTTON_RELEASED", btn.id);
-#ifdef _DEBUG
-                std::cout << "Mouse button RELEASED: "
-                    << "VK=0x" << std::hex << btn.vk << std::dec
-                    << ", ID=" << btn.id
-                    << ", Index=" << btn.index << std::endl;
-#endif
-            }
-            g_mouseState[btn.index] = isDown;
         }
 
-        // Проверка клавиши F
-        static bool lastFState = false;
-        SHORT fState = GetAsyncKeyState('F');
-        bool fDown = (fState & 0x8000) != 0;
-        if (fDown && !lastFState) {
+        // Обработка NumPad (0-9)
+        for (int vk = VK_NUMPAD0; vk <= VK_NUMPAD9; ++vk) {
+            bool isDown = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            bool wasDown = g_prevKeyState[vk] & 0x80;
+
+            if (isDown != wasDown) {
+                int arg = 10 + (vk - VK_NUMPAD0);
+                if (isDown) {
+                    QueueInputEvent("MOUSE_BUTTON_PRESSED", arg);
+                }
+                else {
+                    QueueInputEvent("MOUSE_BUTTON_RELEASED", arg);
+                }
+                g_prevKeyState[vk] = isDown ? 0x80 : 0;
+            }
+        }
+
+        // Обработка клавиши F
+        bool fDown = (GetAsyncKeyState('F') & 0x8000) != 0;
+        bool fWasDown = g_prevKeyState['F'] & 0x80;
+
+        if (fDown && !fWasDown) {
             QueueInputEvent("G_PRESSED", 'F');
-#ifdef _DEBUG
-            std::cout << "Клавиша F нажата\n";
-#endif
         }
-        lastFState = fDown;
+
+        // Сохраняем состояние F
+        g_prevKeyState['F'] = fDown ? 0x80 : 0;
 
     }
     catch (const std::exception& e) {
-        std::cerr << "EXCEPTION in input polling: " << e.what() << std::endl;
-        OutputLogMessage("[INPUT POLLING ERROR] " + std::string(e.what()) + "\n");
+        OutputLogMessage("[INPUT ERROR] " + std::string(e.what()) + "\n");
     }
     catch (...) {
-        std::cerr << "UNKNOWN EXCEPTION in input polling" << std::endl;
-        OutputLogMessage("[INPUT POLLING UNKNOWN ERROR]\n");
+        OutputLogMessage("[UNKNOWN INPUT ERROR]\n");
     }
 }
-static InputThread g_InputThread;
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    // Включаем консоль для отладки
-    //AllocConsole();
-    //FILE* fDummy;
-    //freopen_s(&fDummy, "CONOUT$", "w", stdout);
-    //freopen_s(&fDummy, "CONOUT$", "w", stderr);
-    //SetConsoleTitleA("Debug Console");
-    //std::cout << "Приложение запущено. Отладка включена.\n";
+    // Настройка высокоточного таймера
+    TIMECAPS tc;
+    if (timeGetDevCaps(&tc, sizeof(TIMECAPS)) == TIMERR_NOERROR) {
+        // Исправленная строка:
+        UINT minRes = (tc.wPeriodMin > 1u) ? tc.wPeriodMin : 1u;
+        g_timerResolution = (minRes < tc.wPeriodMax) ? minRes : tc.wPeriodMax;
+        timeBeginPeriod(g_timerResolution);
+    }
+
+    // Установка максимального приоритета
+    SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    // Инициализация состояний
+    ZeroMemory(g_prevKeyState, sizeof(g_prevKeyState));
 
     WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L,
                       hInstance, NULL, NULL, NULL, NULL,
@@ -210,7 +224,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     config.OversampleV = 2;
     config.PixelSnapH = true;
 
-    // Загрузка TTF с поддержкой кириллицы
+    // Загрузка шрифта
     ImGui::GetIO().Fonts->AddFontFromFileTTF(
         "assets/fonts/JetBrainsMono-Regular.ttf", 18.0f, &config,
         ImGui::GetIO().Fonts->GetGlyphRangesCyrillic()
@@ -232,45 +246,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     SetTimer(hwnd, INPUT_TIMER_ID, INPUT_POLL_INTERVAL, nullptr);
 
     // Запуск GUI таймера
-    SetTimer(hwnd, GUI_TIMER_ID, 7, nullptr);
-
-    std::cout << "Таймеры запущены:\n";
-    std::cout << "- Input polling: " << INPUT_POLL_INTERVAL << "мс (" << (1000 / INPUT_POLL_INTERVAL) << "Hz)\n";
-    std::cout << "- GUI refresh: 7мс (~142Hz)\n";
-
-    // Запуск потока ввода
-    g_InputThread.SetCallback([](int vk) {
-        if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9) {
-            int arg = 9 + (vk - VK_NUMPAD1 + 1); // 10-18
-            OutputLogMessage("InputThread: Нажат Num" + std::to_string(vk - VK_NUMPAD0) + "\n");
-            if (g_pLuaEngine) {
-                g_pLuaEngine->CallOnEvent("MOUSE_BUTTON_PRESSED", arg);
-            }
-        }
-        else if (vk == VK_NUMPAD0) {
-            OutputLogMessage("InputThread: Нажат Num0\n");
-            if (g_pLuaEngine) {
-                g_pLuaEngine->CallOnEvent("MOUSE_BUTTON_PRESSED", 19);
-            }
-        }
-        });
-    g_InputThread.Start();
+    SetTimer(hwnd, GUI_TIMER_ID, 16, nullptr); // 60 FPS
 
     MSG msg;
     ZeroMemory(&msg, sizeof(msg));
     while (msg.message != WM_QUIT) {
         // Обрабатываем сообщения Windows
-        while (::PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
+        if (::PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
             ::TranslateMessage(&msg);
             ::DispatchMessage(&msg);
         }
-
-        // Легкая пауза для снижения нагрузки на CPU
-        Sleep(1);
+        else {
+            // Небольшая пауза для снижения нагрузки на CPU
+            Sleep(1);
+        }
     }
 
-    // Остановка потока перед выходом
-    g_InputThread.Stop();
+    // Восстановление настроек системы
+    timeEndPeriod(g_timerResolution);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
     KillTimer(hwnd, INPUT_TIMER_ID);
     KillTimer(hwnd, GUI_TIMER_ID);
@@ -339,6 +334,37 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
 
     switch (msg) {
+    case WM_LBUTTONDOWN:
+        QueueInputEvent("MOUSE_BUTTON_PRESSED", 1);
+        return 0;
+    case WM_LBUTTONUP:
+        QueueInputEvent("MOUSE_BUTTON_RELEASED", 1);
+        return 0;
+    case WM_RBUTTONDOWN:
+        QueueInputEvent("MOUSE_BUTTON_PRESSED", 2);
+        return 0;
+    case WM_RBUTTONUP:
+        QueueInputEvent("MOUSE_BUTTON_RELEASED", 2);
+        return 0;
+    case WM_MBUTTONDOWN:
+        QueueInputEvent("MOUSE_BUTTON_PRESSED", 3);
+        return 0;
+    case WM_MBUTTONUP:
+        QueueInputEvent("MOUSE_BUTTON_RELEASED", 3);
+        return 0;
+    case WM_XBUTTONDOWN:
+        if (HIWORD(wParam) == XBUTTON1)
+            QueueInputEvent("MOUSE_BUTTON_PRESSED", 4);
+        else if (HIWORD(wParam) == XBUTTON2)
+            QueueInputEvent("MOUSE_BUTTON_PRESSED", 5);
+        return 0;
+    case WM_XBUTTONUP:
+        if (HIWORD(wParam) == XBUTTON1)
+            QueueInputEvent("MOUSE_BUTTON_RELEASED", 4);
+        else if (HIWORD(wParam) == XBUTTON2)
+            QueueInputEvent("MOUSE_BUTTON_RELEASED", 5);
+        return 0;
+
     case WM_TIMER:
         if (wParam == INPUT_TIMER_ID) {
             ProcessInputPolling();
