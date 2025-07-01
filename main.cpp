@@ -24,9 +24,7 @@ static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 
 // Таймеры
-#define INPUT_TIMER_ID 1
 #define GUI_TIMER_ID 2
-#define INPUT_POLL_INTERVAL 15  // 1мс = 1000Hz
 
 // Глобальные переменные
 static BYTE g_prevKeyState[256] = {};   // Предыдущее состояние клавиш
@@ -54,7 +52,6 @@ void CreateRenderTarget();
 void CleanupRenderTarget();
 bool CreateDeviceD3D(HWND);
 void CleanupDeviceD3D();
-void ProcessInputPolling();
 void ProcessEventQueue();
 
 // Глобальный HWND
@@ -122,96 +119,6 @@ void ProcessEventQueue() {
             OutputLogMessage("Queue size: " + std::to_string(g_eventQueue.size()) + "\n");
             lastLog = now;
         }
-    }
-}
-
-// Оптимизированная высокочастотная обработка ввода
-void ProcessInputPolling() {
-    // Статические массивы для отслеживания состояний - инициализируются один раз
-    static DWORD keyPressTime[256] = { 0 };
-    static bool keyWasPressed[256] = { false };
-
-    // Константы для оптимизации
-    static constexpr DWORD debounceTime = 5; // 5ms фильтр дребезга
-
-    try {
-        const DWORD currentTime = GetTickCount(); // Вызываем один раз
-
-        // Оптимизированная обработка кнопок мыши - массив структур
-        static constexpr struct MouseButton {
-            int vk;
-            int id;
-        } buttons[] = {
-            { VK_LBUTTON, 1 },
-            { VK_RBUTTON, 2 },
-            { VK_MBUTTON, 3 },
-            { VK_XBUTTON1, 4 },
-            { VK_XBUTTON2, 5 },
-        };
-
-        for (const auto& btn : buttons) {
-            const SHORT state = GetAsyncKeyState(btn.vk);
-            const bool isDown = (state & 0x8000) != 0;
-            const bool wasPressedSinceLastCall = (state & 0x0001) != 0;
-
-            // Обнаружение нового нажатия
-            if (!keyWasPressed[btn.vk] && (isDown || wasPressedSinceLastCall)) {
-                QueueInputEvent("MOUSE_BUTTON_PRESSED", btn.id);
-                keyWasPressed[btn.vk] = true;
-                keyPressTime[btn.vk] = currentTime;
-            }
-            // Обнаружение отпускания
-            else if (keyWasPressed[btn.vk] && !isDown) {
-                // Проверяем, не было ли это очень коротким нажатием
-                if (currentTime - keyPressTime[btn.vk] > debounceTime) {
-                    QueueInputEvent("MOUSE_BUTTON_RELEASED", btn.id);
-                }
-                keyWasPressed[btn.vk] = false;
-            }
-        }
-
-        // Оптимизированная обработка NumPad (0-9) - цикл с константами
-        static constexpr int numpadStart = VK_NUMPAD0;
-        static constexpr int numpadEnd = VK_NUMPAD9;
-        static constexpr int numpadOffset = 10;
-
-        for (int vk = numpadStart; vk <= numpadEnd; ++vk) {
-            const SHORT state = GetAsyncKeyState(vk);
-            const bool isDown = (state & 0x8000) != 0;
-            const bool wasPressedSinceLastCall = (state & 0x0001) != 0;
-            const int arg = numpadOffset + (vk - numpadStart);
-
-            if (!keyWasPressed[vk] && (isDown || wasPressedSinceLastCall)) {
-                QueueInputEvent("MOUSE_BUTTON_PRESSED", arg);
-                keyWasPressed[vk] = true;
-                keyPressTime[vk] = currentTime;
-            }
-            else if (keyWasPressed[vk] && !isDown) {
-                if (currentTime - keyPressTime[vk] > debounceTime) {
-                    QueueInputEvent("MOUSE_BUTTON_RELEASED", arg);
-                }
-                keyWasPressed[vk] = false;
-            }
-        }
-
-        // Оптимизированная обработка клавиши F
-        static constexpr int fKey = 'F';
-        const SHORT fState = GetAsyncKeyState(fKey);
-        const bool fDown = (fState & 0x8000) != 0;
-        const bool fPressedSinceLastCall = (fState & 0x0001) != 0;
-
-        static bool fWasPressed = false;
-
-        if (!fWasPressed && (fDown || fPressedSinceLastCall)) {
-            QueueInputEvent("G_PRESSED", fKey);
-            fWasPressed = true;
-        }
-        else if (fWasPressed && !fDown) {
-            fWasPressed = false;
-        }
-    }
-    catch (...) {
-        // Краткая обработка ошибок - минимальные накладные расходы
     }
 }
 
@@ -294,9 +201,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         luaEngine.ReloadScript();
         });
 
-    // Запуск высокочастотного таймера для ввода
-    SetTimer(hwnd, INPUT_TIMER_ID, INPUT_POLL_INTERVAL, nullptr);
-
     // Запуск GUI таймера
     SetTimer(hwnd, GUI_TIMER_ID, 16, nullptr); // 60 FPS
 
@@ -319,7 +223,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
-    KillTimer(hwnd, INPUT_TIMER_ID);
     KillTimer(hwnd, GUI_TIMER_ID);
     g_pLuaEngine = nullptr;
     g_pGui = nullptr;
@@ -389,10 +292,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     switch (msg) {
     case WM_TIMER:
-        if (wParam == INPUT_TIMER_ID) {
-            ProcessInputPolling();
-        }
-        else if (wParam == GUI_TIMER_ID) {
+        if (wParam == GUI_TIMER_ID) {
             ProcessEventQueue();
 
             // Обновление GUI
@@ -433,44 +333,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         ::PostQuitMessage(0);
         return 0;
-
-        // Оптимизированная обработка сообщений мыши - константы вместо магических чисел
-    case WM_LBUTTONDOWN:
-        QueueInputEvent("MOUSE_BUTTON_PRESSED", 1);
-        return 0;
-    case WM_LBUTTONUP:
-        QueueInputEvent("MOUSE_BUTTON_RELEASED", 1);
-        return 0;
-    case WM_RBUTTONDOWN:
-        QueueInputEvent("MOUSE_BUTTON_PRESSED", 2);
-        return 0;
-    case WM_RBUTTONUP:
-        QueueInputEvent("MOUSE_BUTTON_RELEASED", 2);
-        return 0;
-    case WM_MBUTTONDOWN:
-        QueueInputEvent("MOUSE_BUTTON_PRESSED", 3);
-        return 0;
-    case WM_MBUTTONUP:
-        QueueInputEvent("MOUSE_BUTTON_RELEASED", 3);
-        return 0;
-    case WM_XBUTTONDOWN:
-    {
-        const WORD button = HIWORD(wParam);
-        if (button == XBUTTON1)
-            QueueInputEvent("MOUSE_BUTTON_PRESSED", 4);
-        else if (button == XBUTTON2)
-            QueueInputEvent("MOUSE_BUTTON_PRESSED", 5);
-    }
-    return 0;
-    case WM_XBUTTONUP:
-    {
-        const WORD button = HIWORD(wParam);
-        if (button == XBUTTON1)
-            QueueInputEvent("MOUSE_BUTTON_RELEASED", 4);
-        else if (button == XBUTTON2)
-            QueueInputEvent("MOUSE_BUTTON_RELEASED", 5);
-    }
-    return 0;
 
     case WM_INPUT:
     {
